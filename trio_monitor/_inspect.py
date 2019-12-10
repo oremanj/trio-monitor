@@ -251,7 +251,7 @@ def _inspect_frame_cpython(frame: FrameType) -> FrameDetails:
 
 
 _pypy_type_desc_from_index: List[str] = []
-_pypy_type_index_from_id: Dict[int, int] = []
+_pypy_type_index_from_id: Dict[int, int] = {}
 
 
 def _fill_pypy_typemaps():
@@ -342,6 +342,10 @@ def _inspect_frame_pypy(frame: FrameType) -> FrameDetails:
         # only ones we care about (used for context managers too)
         blocks = [blk for blk in blocks if "FinallyBlock" in _pypy_typename(blk)]
 
+    # This seems to be necessary to reliably make the object representations
+    # correct before we start peeking at them.
+    gc.collect()
+
     def unwrap_gcref(ref: gc.GcRef) -> "ctypes.pointer[ctypes.c_ulong]":
         ref_p = ctypes.pointer(ctypes.c_ulong.from_address(id(ref)))
         assert "W_GcRef" in _pypy_typename_from_first_word(ref_p[0])
@@ -365,13 +369,13 @@ def _inspect_frame_pypy(frame: FrameType) -> FrameDetails:
                 except StopIteration:
                     break
 
-    details = FrameDetails(stack=build_full_stack(valuestack))
+    details = FrameDetails(stack=list(build_full_stack(valuestack)))
     for block_ref in blocks:
         block_p = unwrap_gcref(block_ref)
         assert _pypy_typename_from_first_word(block_p[0]) == (
             "GcStruct pypy.interpreter.pyopcode.FinallyBlock"
         )
-        details.append(
+        details.blocks.append(
             FrameDetails.FinallyBlock(handler=block_p[1], level=block_p[3])
         )
     return details
