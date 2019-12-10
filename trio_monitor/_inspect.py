@@ -6,10 +6,12 @@ import gc
 import inspect
 import math
 import sys
+import traceback
 import trio
 import trio_typing
+import warnings
 from functools import partial
-from types import FrameType
+from types import FrameType, CodeType
 from typing import (
     Any,
     Awaitable,
@@ -26,31 +28,71 @@ from typing import (
 )
 
 
-def _contexts_active_in_frame(
-    frame: FrameType
-) -> List[Tuple[object, Optional[str], int]]:
-    """Inspects the frame object ``frame`` to try to determine which
-    context managers are currently active; returns a list of tuples
-    (manager, name, start_line) describing the active context managers
-    from outermost to innermost. In each such tuple, ``manager`` is
-    the context manager object, ``name`` is the name of the local
-    variable that the result of its ``__enter__`` or ``__aenter__``
-    method was assigned to, and ``start_line`` is the line number on
-    which the ``with`` or ``async with`` block began.
+@attr.s(auto_attribs=True, slots=True)
+class ContextInfo:
+    """Information about a sync or async context manager that's
+    currently active in a frame."""
 
-    The frame must be suspended at a yield or await. Raises AssertionError
-    if we couldn't make sense of this frame.
+    #: True for an async context manager, False for a sync context manager.
+    is_async: bool
 
+    #: The context manager object itself (the ``foo`` in ``async with foo:``)
+    manager: object = None
+
+    #: The name to which the result of the context manager was assigned
+    #: (``"bar"`` in ``async with foo as bar:``), or ``None`` if it wasn't
+    #: assigned anywhere or if we couldn't determine where it was assigned.
+    varname: Optional[str] = None
+
+    #: The line number of the ``with`` or ``async with`` statement that
+    #: entered the context manager, or ``None`` if we couldn't determine it.
+    start_line: Optional[int] = None
+
+
+def _contexts_active_by_referents(frame: FrameType) -> List[ContextInfo]:
+    """Version of `contexts_active_in_frame` that relies only on
+    `gc.get_referents`, and thus can be used on any Python interpreter
+    that supports the `gc` module.
+
+    This can't determine the `~ContextInfo.varname` or
+    `~ContextInfo.start_line` members of `ContextInfo`, and it's
+    possible to fool it in some unlikely circumstances (e.g., if you
+    have a local variable that points directly to an ``__exit__`` or
+    ``__aexit__`` method).
     """
+    ret: List[ContextInfo] = []
 
-    assert sys.implementation.name == "cpython"
+    refs = gc.get_referents(frame)
+    for idx, referent in enumerate(refs):
+        if (
+            isinstance(referent, types.MethodType)
+            and referent.__func__.__name__ in ("__exit__", "__aexit__")
+        ):
+            # 'with' and 'async with' statements push a reference to the
+            # __exit__ or __aexit__ method that they'll call when exiting.
+            ret.append(
+                ContextInfo(
+                    is_async="a" in referent.__func__.__name__,
+                    manager=referent.__self__,
+                )
+            )
+    return ret
 
-    # Bytecode analysis to figure out where each 'with' or 'async with'
-    # block starts, so we can look up the extra info based on the bytecode
-    # offset of the WITH_CLEANUP_START instruction later on.
-    with_block_info: Dict[int, Tuple[Optional[str], int]] = {}
-    insns = list(dis.Bytecode(frame.f_code))
-    current_line = frame.f_code.co_firstlineno
+
+def _analyze_with_blocks(code: CodeType) -> Dict[int, ContextInfo]:
+    """Analyze the bytecode of the given code object, returning a
+    partially filled-in `ContextInfo` object for each ``with`` or
+    ``async with`` block.
+
+    Each key in the returned mapping is the bytecode offset of a
+    ``WITH_CLEANUP_START`` instruction that ends a ``with`` or ``async
+    with`` block. The corresponding value is a `ContextInfo` object
+    appropriate to that block, with all fields except ``manager``
+    filled in.
+    """
+    with_block_info: Dict[int, ContextInfo] = {}
+    insns = list(dis.Bytecode(code))
+    current_line = code.co_firstlineno
     for insn, inext in zip(insns[:-1], insns[1:]):
         if insn.starts_line is not None:
             current_line = insn.starts_line
@@ -60,7 +102,27 @@ def _contexts_active_in_frame(
             else:
                 store_to = None
             cleanup_offset = insn.argval
-            with_block_info[cleanup_offset] = (store_to, current_line)
+            with_block_info[cleanup_offset] = ContextInfo(
+                is_async=(insn.opname == "SETUP_ASYNC_WITH"),
+                varname=store_to,
+                start_line=current_line,
+            )
+    return with_block_info
+
+
+@attr.s(auto_attribs=True)
+class FrameDetails:
+    @attr.s(auto_attribs=True)
+    class FinallyBlock:
+        handler: int  # bytecode offset where the finally handler starts
+        level: int  # value stack depth at which handler begins execution
+
+    blocks: List[FinallyBlock] = attr.Factory(list)
+    stack: List[object] = attr.Factory(list)
+
+
+def _inspect_frame_cpython(frame: FrameType) -> FrameDetails:
+    details = FrameDetails()
 
     # This is the layout of the start of a frame object. It has a couple
     # fields we can't access from Python, especially f_valuestack and
@@ -122,7 +184,11 @@ def _contexts_active_in_frame(
         ctypes.c_ulong.from_address(id(frame) + offset).value
         for offset in range(stack_start_offset, stack_top_offset, wordsize)
     ]
-    # Now stack[i] corresponds to f_stacktop[i] in C.
+    # Now stack[i] corresponds to f_stacktop[i] in C. Map addresses back
+    # to actual objects, using gc.get_referents() so as not to crash if
+    # we got the wrong addresses somehow.
+    object_from_id_map = {id(obj): obj for obj in gc.get_referents(frame)}
+    details.stack = [object_from_id_map.get(value) for value in stack]
 
     # Figure out the active context managers. Each context manager
     # pushes a block to a fixed-size block stack (20 12-byte entries,
@@ -141,11 +207,6 @@ def _contexts_active_in_frame(
             # an __exit__ or __aexit__ method at stack index b_level - 1
             ("b_level", ctypes.c_int),
         ]
-
-    active_context_exit_ids = []
-    active_context_exit_offsets = []
-    coro_aexiting_now_id = None
-    coro_aexiting_now_offset = None
 
     blockstack_offset = localsplus_offset - 20 * ctypes.sizeof(PyTryBlock)
     f_iblock = ctypes.c_int.from_address(id(frame) + blockstack_offset - 8)
@@ -180,21 +241,182 @@ def _contexts_active_in_frame(
         ):
             # Yup. Still fully inside the block; use b_level to find the
             # __exit__ or __aexit__ method
-            active_context_exit_ids.append(stack[block.b_level - 1])
-            active_context_exit_offsets.append(block.b_handler)
+            details.blocks.append(
+                FrameDetails.FinallyBlock(handler=block.b_handler, level=block.b_level)
+            )
 
         blockstack_offset += ctypes.sizeof(PyTryBlock)
 
+    return details
+
+
+_pypy_type_desc_from_index: List[str] = []
+_pypy_type_index_from_id: Dict[int, int] = []
+
+
+def _fill_pypy_typemaps():
+    assert sys.implementation.name == "pypy"
+    import zlib
+
+    for line in zlib.decompress(gc.get_typeids_z()).decode("ascii").splitlines():
+        memberNNN, rest = line.split(None, 1)
+        header, brace, fields = rest.partition(" { ")
+        _pypy_type_desc_from_index.append(header)
+
+    for idx, typeid in enumerate(gc.get_typeids_list()):
+        _pypy_type_index_from_id[typeid] = idx
+
+
+if sys.implementation.name == "pypy":
+    _fill_pypy_typemaps()
+
+
+def _pypy_typename(obj: object) -> str:
+    return _pypy_type_desc_from_index[gc.get_rpy_type_index(obj)]
+
+
+def _pypy_typename_from_first_word(first_word: int) -> str:
+    if sys.maxsize > 2**32:
+        mask = 0xffffffff
+    else:
+        mask = 0xffff
+    return _pypy_type_desc_from_index[_pypy_type_index_from_id[first_word & mask]]
+
+
+def _inspect_frame_pypy(frame: FrameType) -> FrameDetails:
+    assert sys.implementation.name == "pypy"
+
+    # Somewhere in the list of immediate referents of the frame is its
+    # code object.
+    frame_refs = gc.get_rpy_referents(frame)
+    code_idx, = [idx for idx, ref in enumerate(frame_refs) if ref is frame.f_code]
+
+    # The two referents immediately before the code object are
+    # the last entry in the block list, followed by the value stack.
+    # These are interp-level objects so we see them as opaque GcRefs.
+    # We locate them by reference to the code object because the
+    # earlier references might or might not be present (e.g., one depends
+    # on whether the frame's f_locals have been accessed yet or not).
+    assert code_idx >= 1
+    valuestack_ref = frame_refs[code_idx - 1]
+    assert isinstance(valuestack_ref, gc.GcRef)
+
+    lastblock_ref: Optional[gc.GcRef] = None
+    if code_idx >= 2:
+        lastblock_ref = frame_refs[code_idx - 2]
+        if "Block" not in _pypy_typename(lastblock_ref):
+            # There are no blocks active in this frame. lastblock was
+            # skipped when getting referents because it's null, so the
+            # previous field (generator weakref or f_back) bled through.
+            assert (
+                _pypy_typename(lastblock_ref) == "GcStruct weakref"
+                or "Frame" in _pypy_typename(lastblock_ref)
+            )
+            lastblock_ref = None
+        else:
+            assert isinstance(lastblock_ref, gc.GcRef)
+
+    # The value stack's referents are everything on the value stack.
+    # Unfortunately we can't rely on the indices here because 'del x'
+    # leaves a null (not None) that will be skipped. We'll fill them
+    # in from ctypes later. Note that this includes locals/cellvars/
+    # freevars (at the start, in that order).
+    valuestack = gc.get_rpy_referents(valuestack_ref)
+
+    # The block list is a linked list in PyPy, unlike in CPython where
+    # it's an array. The head of the list is the newest block.
+    # Iterate through and unroll it into a list of GcRefs to blocks.
+    blocks: List[gc.GcRef] = []
+    if lastblock_ref is not None:
+        blocks.append(lastblock_ref)
+        while True:
+            assert len(blocks) < 100
+            more = gc.get_rpy_referents(blocks[-1])
+            if not more:
+                break
+            blocks.extend(more)
+        assert all("Block" in _pypy_typename(blk) for blk in blocks)
+        # Reverse so the oldest block is at the beginning
+        blocks = blocks[::-1]
+        # Remove those that aren't FinallyBlocks -- those are the
+        # only ones we care about (used for context managers too)
+        blocks = [blk for blk in blocks if "FinallyBlock" in _pypy_typename(blk)]
+
+    def unwrap_gcref(ref: gc.GcRef) -> "ctypes.pointer[ctypes.c_ulong]":
+        ref_p = ctypes.pointer(ctypes.c_ulong.from_address(id(ref)))
+        assert "W_GcRef" in _pypy_typename_from_first_word(ref_p[0])
+        return ctypes.pointer(ctypes.c_ulong.from_address(ref_p[1]))
+
+    # Fill in nulls in the value stack. This requires inspecting the
+    # memory that backs the list object. An RPython list is two words
+    # (typeid, length) followed by one word per element.
+    def build_full_stack(refs: List[object]) -> Iterator[object]:
+        stackdata_p = unwrap_gcref(valuestack_ref)
+        assert _pypy_typename_from_first_word(stackdata_p[0]) == (
+            "GcArray of * GcStruct object"
+        )
+        ref_iter = iter(refs)
+        for idx in range(stackdata_p[1]):
+            if stackdata_p[2 + idx] == 0:
+                yield None
+            else:
+                try:
+                    yield next(ref_iter)
+                except StopIteration:
+                    break
+
+    details = FrameDetails(stack=build_full_stack(valuestack))
+    for block_ref in blocks:
+        block_p = unwrap_gcref(block_ref)
+        assert _pypy_typename_from_first_word(block_p[0]) == (
+            "GcStruct pypy.interpreter.pyopcode.FinallyBlock"
+        )
+        details.append(
+            FrameDetails.FinallyBlock(handler=block_p[1], level=block_p[3])
+        )
+    return details
+
+
+def _contexts_active_by_trickery(frame: FrameType) -> List[ContextInfo]:
+    """Version of `contexts_active_in_frame` that provides full information
+    on tested versions of CPython and PyPy by accessing the block stack.
+    This is an internal implementation detail so it may stop working as
+    Python's internals change. The inspectors use lots of assertions so
+    such failures will hopefully downgrade to the by_referents version,
+    but there are no guarantees -- they might just segfault if we get
+    really unlucky.
+    """
+    with_block_info = _analyze_with_blocks(frame.f_code)
+    if sys.implementation.name == "cpython":
+        details = _inspect_frame_cpython(frame)
+    elif sys.implementation.name == "pypy":
+        details = _inspect_frame_pypy(frame)
+    else:
+        raise NotImplementedError("trickery not supported on this interpreter")
+    return [
+        attr.evolve(
+            with_block_info[blk.handler],
+            manager=details.stack[blk.level - 1].__self__
+        )
+        for blk in details.blocks
+    ]
+
+
+"""
     # Decide whether it looks like we're in the middle of an
     # __aexit__, which would already have been popped from the block
     # stack.  In this case we can only get the coroutine, not the
     # original __aexit__ method.
-    if list(co.co_code[frame.f_lasti - 4 : frame.f_lasti + 4 : 2]) == [
-        dis.opmap["WITH_CLEANUP_START"],
-        dis.opmap["GET_AWAITABLE"],
-        dis.opmap["LOAD_CONST"],
-        dis.opmap["YIELD_FROM"],
-    ]:
+    insns = list(dis.Bytecode(co.co_code))
+    last_idx, = [
+        idx for idx, insn in enumerate(insns) if frame.f_lasti == insn.offset
+    ]
+    if (
+        last_idx >= 2
+        and last_idx <= len(insns) - 2
+        and [insn.opname for insn in insns[last_idx - 2 : last_idx + 2]]
+        == ["WITH_CLEANUP_START", "GET_AWAITABLE", "LOAD_CONST", "YIELD_FROM"]
+    ):
         coro_aexiting_now_id = stack[-1]
         coro_aexiting_now_offset = frame.f_lasti - 4
 
@@ -215,22 +437,80 @@ def _contexts_active_in_frame(
         coro_aexiting_now_id is not None
     )
 
-    active_context_info = []
-    for ident, offset in zip(active_context_exit_ids, active_context_exit_offsets):
-        active_context_info.append(
-            (object_from_id_map[ident].__self__, *with_block_info[offset])
-        )
-
     if coro_aexiting_now_id is not None:
         # Assume the context manager is the 1st coroutine argument.
         coro = object_from_id_map[coro_aexiting_now_id]
         args = inspect.getargvalues(coro.cr_frame)
         assert coro_aexiting_now_offset is not None
         active_context_info.append(
-            (args.locals[args.args[0]], *with_block_info[coro_aexiting_now_offset])
+            attr.evolve(
+                with_block_info[coro_aexiting_now_offset],
+                manager=args.locals[args.args[0]],
+            )
         )
 
     return active_context_info
+
+"""
+
+
+_can_use_trickery = sys.implementation.name in ("cpython", "pypy")
+if _can_use_trickery:
+    def _validate_trickery():
+        from contextlib import contextmanager
+
+        @contextmanager
+        def noop():
+            yield
+
+        noop_cm = noop()
+
+        def fn():
+            with noop_cm as xyzzy:
+                yield
+
+        gen = fn()
+        gen.send(None)
+        try:
+            contexts = _contexts_active_by_trickery(gen.gi_frame)
+            assert len(contexts) == 1
+            assert contexts[0].varname == "xyzzy" and contexts[0].manager is noop_cm
+        except Exception as ex:
+            warnings.warn(
+                "Inspection trickery doesn't work on this interpreter: {!r}. "
+                "Task tree printing will be less accurate. Please file a bug."
+                .format(ex)
+            )
+            traceback.print_exc()
+            return False
+        return True
+
+    _can_use_trickery = _validate_trickery()
+
+
+def contexts_active_in_frame(frame: FrameType) -> List[ContextInfo]:
+    """Inspects the frame object ``frame`` to try to determine which
+    context managers are currently active; returns a list of
+    `ContextInfo` objects describing the active context managers
+    from outermost to innermost.
+
+    The frame must be suspended at a yield or await. Raises AssertionError
+    if we couldn't make sense of this frame.
+
+    """
+    if _can_use_trickery:
+        try:
+            return _contexts_active_by_trickery(frame)
+        except Exception as ex:
+            warnings.warn(
+                "Inspection trickery failed on frame {!r}: {!r}. "
+                "Task tree printing will be less accurate. Please file a bug."
+                .format(frame, ex)
+            )
+            traceback.print_exc()
+            return _contexts_active_by_referents(frame)
+    else:
+        return _contexts_active_by_referents(frame)
 
 
 def frame_and_next(
