@@ -1,0 +1,6 @@
+[tool.towncrier]
+package = "trio_monitor"
+filename = "docs/source/history.rst"
+directory = "newsfragments"
+underlines = ["-", "~", "^"]
+issue_format = "`#{issue} <https://github.com/oremanj/trio-monitor/issues/{issue}>`__"
